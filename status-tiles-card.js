@@ -6,13 +6,75 @@ class StatusTilesCard extends HTMLElement {
     this._hass = null;
     this._pressTimer = null;
     this._longPressHandled = false;
+    this._dateExpiryTimer = null;
     this._suppressed = this._loadSuppressed();
     this._lastWarningStates = {};
+    this._onListRequest = (event) => {
+      for (const tile of this._config?.tiles || []) {
+        if (tile.list_id === event.detail.source) {
+          event.detail.providers.push({ card: this, tile });
+        }
+      }
+    };
+  }
+
+  connectedCallback() {
+    document.addEventListener("status-tiles-list-request", this._onListRequest);
+    this._notifyLists();
+  }
+
+  disconnectedCallback() {
+    document.removeEventListener("status-tiles-list-request", this._onListRequest);
+    this._onPointerUp();
+    if (this._dateExpiryTimer) {
+      window.clearTimeout(this._dateExpiryTimer);
+      this._dateExpiryTimer = null;
+    }
+    this._notifyLists();
+  }
+
+  _notifyLists() {
+    document.dispatchEvent(new CustomEvent("status-tiles-list-changed"));
   }
 
   setConfig(config) {
     if (!config || !Array.isArray(config.tiles)) {
       throw new Error("Status Tiles Card: 'tiles' array is required.");
+    }
+    const listIds = new Set();
+    for (const tile of config.tiles) {
+      if (tile.list_id != null) {
+        if (typeof tile.list_id !== "string" || !tile.list_id.trim() || listIds.has(tile.list_id)) {
+          throw new Error("Status Tiles Card: 'list_id' must be a non-empty, unique string.");
+        }
+        listIds.add(tile.list_id);
+      }
+      if (tile.exclude != null && (!Array.isArray(tile.exclude) ||
+          tile.exclude.some((word) => typeof word !== "string" || !word.trim()))) {
+        throw new Error("Status Tiles Card: 'exclude' must be an array of non-empty strings.");
+      }
+      if (tile.long_press_action != null) {
+        const longPressEntity = tile.long_press_entity;
+        const hasValidSwitchEntity =
+          typeof longPressEntity === "string" &&
+          longPressEntity.slice(0, "switch.".length) === "switch." &&
+          longPressEntity.length > "switch.".length;
+        if (tile.long_press_action !== "turn_on" || !hasValidSwitchEntity) {
+          throw new Error(
+            "Status Tiles Card: 'long_press_action: turn_on' requires a 'long_press_entity' in the switch domain."
+          );
+        }
+      }
+      if (tile.states?.some((rule) =>
+        rule?.date_within_days != null &&
+        (typeof rule.date_within_days !== "number" ||
+         !Number.isFinite(rule.date_within_days) ||
+         rule.date_within_days <= 0)
+      )) {
+        throw new Error(
+          "Status Tiles Card: 'date_within_days' must be a positive number."
+        );
+      }
     }
 
     this._config = {
@@ -29,12 +91,14 @@ class StatusTilesCard extends HTMLElement {
     };
 
     this._render();
+    if (this.isConnected) this._notifyLists();
   }
 
   set hass(hass) {
     this._hass = hass;
     if (!this._config) return;
     this._render();
+    if (this.isConnected) this._notifyLists();
   }
 
   getCardSize() {
@@ -112,7 +176,17 @@ class StatusTilesCard extends HTMLElement {
     }
   }
 
-  _matchState(tile, stateObj) {
+  _parseStateTimestamp(rawState) {
+    const match = String(rawState).match(
+      /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2}))/
+    );
+    if (!match) return null;
+    const normalized = match[1].replace(/([+-]\d{2})(\d{2})$/, "$1:$2");
+    const timestamp = Date.parse(normalized);
+    return Number.isFinite(timestamp) ? timestamp : null;
+  }
+
+  _matchState(tile, stateObj, entityId = stateObj?.entity_id) {
     if (!stateObj || !tile.states) return tile.default || null;
 
     const rawState = stateObj.state;
@@ -121,6 +195,20 @@ class StatusTilesCard extends HTMLElement {
 
     for (const rule of tile.states) {
       if (rule == null) continue;
+
+      if (rule.entity_id_regex) {
+        try {
+          if (!entityId || !new RegExp(rule.entity_id_regex).test(entityId)) continue;
+        } catch (err) {
+          continue;
+        }
+      }
+
+      if (typeof rule.date_within_days === "number") {
+        const timestamp = this._parseStateTimestamp(rawState);
+        const age = timestamp === null ? -1 : Date.now() - timestamp;
+        if (age >= 0 && age <= rule.date_within_days * 86400000) return rule;
+      }
 
       if (hasNumeric && (rule.from != null || rule.to != null)) {
         const fromOk = rule.from == null || numericState >= rule.from;
@@ -162,6 +250,27 @@ class StatusTilesCard extends HTMLElement {
   }
 
   _getTileEntities(tile) {
+    return this._getSelectedEntities(tile).filter((entityId) => {
+      const name = this._hass?.states?.[entityId]?.attributes?.friendly_name || "";
+      const text = `${entityId} ${name}`.toLowerCase();
+      return !(tile.exclude || []).some((pattern) => {
+        const glob = pattern
+          .split("*")
+          .map((part) => part.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"))
+          .join(".*");
+        return new RegExp(glob, "i").test(text);
+      });
+    });
+  }
+
+  _getWarningEntities(tile) {
+    return this._getTileEntities(tile).filter((entityId) => {
+      const stateObj = this._hass?.states?.[entityId];
+      return stateObj && this._isWarning(this._matchState(tile, stateObj, entityId), tile);
+    });
+  }
+
+  _getSelectedEntities(tile) {
     if (Array.isArray(tile.entities) && tile.entities.length) return tile.entities;
     if (tile.entity) return [tile.entity];
 
@@ -174,6 +283,8 @@ class StatusTilesCard extends HTMLElement {
       const domain = entityId.split(".")[0];
 
       if (filter.domain && filter.domain !== domain) return false;
+      if (filter.device_class &&
+          filter.device_class !== stateObj?.attributes?.device_class) return false;
 
       if (filter.entity_id_regex) {
         try {
@@ -259,11 +370,18 @@ class StatusTilesCard extends HTMLElement {
 
   _render() {
     if (!this._config || !this.shadowRoot) return;
+    if (this._dateExpiryTimer) {
+      window.clearTimeout(this._dateExpiryTimer);
+      this._dateExpiryTimer = null;
+    }
 
     const { columns_min, circle_size, tile_gap, suppressed_color, tiles } =
       this._config;
     const scaledCircleSize = Math.round(circle_size * 1.45);
     const scaledGap = Math.min(5, Math.max(2, Math.round(tile_gap * 0.35)));
+    const scaledRowGap = Math.max(28, Math.round(scaledCircleSize * 0.4));
+    const now = Date.now();
+    let nextDateExpiry = null;
 
     const tileHtml = tiles
       .map((tile, index) => {
@@ -273,15 +391,37 @@ class StatusTilesCard extends HTMLElement {
 
         let warningCount = 0;
         let match = null;
+        let warningMatch = null;
+        let warningPriority = Infinity;
         let firstStateObj = null;
 
         entities.forEach((entityId, entityIndex) => {
           const stateObj = this._hass?.states?.[entityId];
           if (entityIndex === 0) firstStateObj = stateObj;
-          const entityMatch = this._matchState(tile, stateObj);
+          for (const rule of tile.states || []) {
+            if (typeof rule?.date_within_days !== "number") continue;
+            const timestamp = this._parseStateTimestamp(stateObj?.state);
+            if (timestamp === null || timestamp > now) continue;
+            const expiry = timestamp + rule.date_within_days * 86400000 + 1;
+            if (expiry > now && (nextDateExpiry === null || expiry < nextDateExpiry)) {
+              nextDateExpiry = expiry;
+            }
+          }
+          const entityMatch = this._matchState(tile, stateObj, entityId);
           if (entityIndex === 0) match = entityMatch;
-          if (this._isWarning(entityMatch, tile)) warningCount += 1;
+          if (this._isWarning(entityMatch, tile)) {
+            warningCount += 1;
+            if (entityMatch) {
+              const ruleIndex = tile.states?.indexOf(entityMatch) ?? -1;
+              const priority = ruleIndex < 0 ? Infinity : ruleIndex;
+              if (!warningMatch || priority < warningPriority) {
+                warningMatch = entityMatch;
+                warningPriority = priority;
+              }
+            }
+          }
         });
+        if (warningMatch) match = warningMatch;
 
         const isWarning = warningCount > 0 || this._isWarning(match, tile);
         const suppressed = !!this._suppressed[key]?.active && isWarning;
@@ -315,10 +455,10 @@ class StatusTilesCard extends HTMLElement {
         const blinkSeconds = typeof blinkValue === "number" ? blinkValue : 0;
         const shouldBlink = blinkSeconds > 0 && !suppressed;
 
-        const showBadge = warningCount > 2;
+        const showBadge = warningCount > 2 || (tile.list_id && warningCount > 0);
 
         return `
-          <div class="tile" data-entity="${primaryEntityId}" data-key="${key}" style="--tile-color: ${color}; --circle-max-size: ${scaledCircleSize}px;${shouldBlink ? ` --blink-duration: ${blinkSeconds}s;` : ""}">
+          <div class="tile" data-index="${index}" data-entity="${primaryEntityId}" data-key="${key}" style="--tile-color: ${color}; --circle-max-size: ${scaledCircleSize}px;${shouldBlink ? ` --blink-duration: ${blinkSeconds}s;` : ""}">
             <div class="circle ${shouldBlink ? "blink" : ""}">
               <ha-icon icon="${icon}"></ha-icon>
               ${showBadge ? `<span class="badge">${warningCount}</span>` : ""}
@@ -350,7 +490,8 @@ class StatusTilesCard extends HTMLElement {
         .grid {
           display: grid;
           grid-template-columns: repeat(5, minmax(0, 1fr));
-          gap: ${scaledGap}px;
+          column-gap: ${scaledGap}px;
+          row-gap: ${scaledRowGap}px;
         }
         .tile {
           position: relative;
@@ -449,6 +590,13 @@ class StatusTilesCard extends HTMLElement {
     `;
 
     this._attachHandlers();
+    if (nextDateExpiry !== null && this.isConnected) {
+      this._dateExpiryTimer = window.setTimeout(() => {
+        this._dateExpiryTimer = null;
+        this._render();
+        this._notifyLists();
+      }, Math.min(nextDateExpiry - Date.now(), 2147483647));
+    }
   }
 
   _attachHandlers() {
@@ -464,18 +612,16 @@ class StatusTilesCard extends HTMLElement {
 
   _onPointerDown(event, tileEl) {
     if (this._pressTimer) window.clearTimeout(this._pressTimer);
-    this._longPressHandled = false;
-    const entityId = tileEl.getAttribute("data-entity");
-    const key = tileEl.getAttribute("data-key");
-    const tile = this._config.tiles.find((t, index) => this._getTileKey(t, index) === key);
+    tileEl.dataset.longPressHandled = "false";
+    const tile = this._config.tiles[Number(tileEl.getAttribute("data-index"))];
     if (!tile) return;
     if (tile.long_press_enabled === false) return;
 
     this._pressTimer = window.setTimeout(() => {
       this._pressTimer = null;
-      this._longPressHandled = true;
+      tileEl.dataset.longPressHandled = "true";
       this._handleLongPress(tile);
-    }, 600);
+    }, 1000);
   }
 
   _onPointerUp() {
@@ -486,21 +632,38 @@ class StatusTilesCard extends HTMLElement {
   }
 
   _onClick(event, tileEl) {
-    if (this._longPressHandled) return; // long-press handled
+    if (tileEl.dataset.longPressHandled === "true") {
+      tileEl.dataset.longPressHandled = "false";
+      return;
+    }
 
-    const entityId = tileEl.getAttribute("data-entity");
-    const key = tileEl.getAttribute("data-key");
-    const tile = this._config.tiles.find((t, index) => this._getTileKey(t, index) === key);
+    const tile = this._config.tiles[Number(tileEl.getAttribute("data-index"))];
     if (!tile) return;
 
     const entities = this._getTileEntities(tile);
-    this._handleTap(entities[0], tile.tap_action);
+    this._handleTap(entities[0] || tile.entity, tile.tap_action);
   }
 
   _handleLongPress(tile) {
+    if (tile.long_press_action === "turn_on") {
+      this._hass.callService("switch", "turn_on", {
+        entity_id: tile.long_press_entity,
+      }).then(
+        () => this._notify("Einschaltbefehl an Zigbee2MQTT gesendet."),
+        (error) => {
+          console.error(
+            `Status Tiles Card: could not turn on ${tile.long_press_entity}.`,
+            error
+          );
+          this._notify("Zigbee2MQTT konnte nicht eingeschaltet werden.");
+        }
+      );
+      return;
+    }
+
     const entityId = tile.entity;
     const stateObj = this._hass?.states?.[entityId];
-    const match = this._matchState(tile, stateObj);
+    const match = this._matchState(tile, stateObj, entityId);
     const isWarning = this._isWarning(match, tile);
 
     if (!isWarning) return;
@@ -513,9 +676,126 @@ class StatusTilesCard extends HTMLElement {
     this._saveSuppressed();
     this._render();
   }
+
+  _notify(message) {
+    this.dispatchEvent(
+      new CustomEvent("hass-notification", {
+        detail: { message },
+        bubbles: true,
+        composed: true,
+      })
+    );
+  }
 }
 
 customElements.define("status-tiles-card", StatusTilesCard);
+
+class StatusTilesList extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: "open" });
+    this._onSourceChanged = () => this._render();
+  }
+
+  connectedCallback() {
+    document.addEventListener("status-tiles-list-changed", this._onSourceChanged);
+    this._render();
+  }
+
+  disconnectedCallback() {
+    document.removeEventListener("status-tiles-list-changed", this._onSourceChanged);
+  }
+
+  setConfig(config) {
+    if (typeof config.source !== "string" || !config.source.trim()) {
+      throw new Error("Status Tiles List: 'source' must match a tile's 'list_id'.");
+    }
+    this._config = config;
+    this._render();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    this._render();
+  }
+
+  getCardSize() {
+    return 3;
+  }
+
+  _render() {
+    if (!this._config || !this.isConnected) return;
+    const detail = { source: this._config.source, providers: [] };
+    document.dispatchEvent(new CustomEvent("status-tiles-list-request", { detail }));
+    this.shadowRoot.innerHTML = `
+      <style>
+        ha-card { padding: 16px; }
+        h2 { margin: 0 0 12px; font-size: 20px; }
+        p { color: var(--secondary-text-color); }
+        button {
+          display: flex; align-items: center; gap: 12px; width: 100%;
+          padding: 12px 0; border: 0; background: none;
+          color: var(--primary-text-color); font: inherit;
+          text-align: left; cursor: pointer;
+        }
+        .name { flex: 1; overflow-wrap: anywhere; }
+        .state { color: var(--secondary-text-color); }
+      </style>
+      <ha-card><h2></h2><div class="rows"></div></ha-card>
+    `;
+    const title = this.shadowRoot.querySelector("h2");
+    const rows = this.shadowRoot.querySelector(".rows");
+    title.textContent = this._config.title || "Betroffene Entities";
+    const message = (text) => {
+      const paragraph = document.createElement("p");
+      paragraph.textContent = text;
+      rows.append(paragraph);
+    };
+    if (detail.providers.length !== 1) {
+      message(detail.providers.length
+        ? `Mehrere Kacheln mit list_id "${this._config.source}". Bitte eindeutige IDs verwenden.`
+        : `Keine Kachel mit list_id "${this._config.source}" in dieser Ansicht gefunden.`);
+      return;
+    }
+    const { card, tile } = detail.providers[0];
+    if (!card._hass || !this._hass) {
+      message("Entity-Zust\u00e4nde sind noch nicht verf\u00fcgbar.");
+      return;
+    }
+    if (!card._getTileEntities(tile).length) {
+      message("Keine passenden Sensoren gefunden.");
+      return;
+    }
+    const entities = card._getWarningEntities(tile);
+    title.textContent += ` (${entities.length})`;
+    if (!entities.length) {
+      message("Keine Warnungen vorhanden.");
+      return;
+    }
+    for (const entityId of entities) {
+      const stateObj = card._hass.states[entityId];
+      const row = document.createElement("button");
+      row.type = "button";
+      const icon = document.createElement("ha-icon");
+      icon.setAttribute("icon", stateObj.attributes.icon || tile.icon || "mdi:alert-circle-outline");
+      const name = document.createElement("span");
+      name.className = "name";
+      name.textContent = stateObj.attributes.friendly_name || entityId;
+      const state = document.createElement("span");
+      state.className = "state";
+      state.textContent = this._hass.formatEntityState
+        ? this._hass.formatEntityState(stateObj)
+        : `${stateObj.state} ${stateObj.attributes.unit_of_measurement || ""}`.trim();
+      row.append(icon, name, state);
+      row.onclick = () => this.dispatchEvent(new CustomEvent("hass-more-info", {
+        detail: { entityId }, bubbles: true, composed: true,
+      }));
+      rows.append(row);
+    }
+  }
+}
+
+customElements.define("status-tiles-list", StatusTilesList);
 
 class StatusTilesCardEditor extends HTMLElement {
   constructor() {
@@ -622,4 +902,10 @@ window.customCards.push({
   description: "Dynamische Status-Kacheln mit Warnungen und Alarm-Sound",
   preview: true,
   configurable: true,
+});
+window.customCards.push({
+  type: "status-tiles-list",
+  name: "Status Tiles Warning List",
+  description: "Warnungen einer Status-Kachel, ohne doppelte Filter",
+  preview: false,
 });
